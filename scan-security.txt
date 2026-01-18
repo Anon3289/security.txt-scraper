@@ -1,0 +1,131 @@
+param(
+  [Parameter(Mandatory = $true)][string]$InputList,   # suppliers.txt
+  [Parameter(Mandatory = $true)][string]$OutputCsv    # security_audit.csv
+)
+
+$headers = @{
+  "User-Agent" = "securitytxt-audit/1.0 (+compliance; contact=security@example.com)"
+  "Accept"     = "text/plain,*/*;q=0.1"
+}
+
+$paths = @("/.well-known/security.txt","/security.txt")
+
+function Get-SecurityTxt {
+  param([string]$Domain)
+
+  foreach ($scheme in @("https://","http://")) {
+    foreach ($p in $paths) {
+      $u = "$scheme$Domain$p"
+      try {
+        # -UseBasicParsing für Windows PowerShell 5.1
+        $resp = Invoke-WebRequest -Uri $u -Headers $headers -MaximumRedirection 5 -TimeoutSec 12 -UseBasicParsing -ErrorAction Stop
+     if ($resp.StatusCode -eq 200 -and $resp.Content) {
+
+  # Wenn HTML geliefert wird, ist es sehr wahrscheinlich NICHT security.txt
+  if ($resp.Content -match '(?is)<!doctype\s+html|<html\b|<head\b|<body\b') {
+    return @($u, $resp.StatusCode, $null, "returned HTML instead of security.txt")
+  }
+
+  return @($u, $resp.StatusCode, $resp.Content, $null)
+}
+
+      } catch {
+        # still try next URL
+        $null = $true
+      }
+    }
+  }
+  return @($null, $null, $null, "not found or unreachable")
+}
+
+function Parse-SecurityTxt {
+  param([string]$Text)
+
+  $result = [ordered]@{
+    Contact = New-Object System.Collections.Generic.List[string]
+    Encryption = ""
+    Policy = ""
+    Acknowledgments = ""
+    Hiring = ""
+    "Preferred-Languages" = ""
+    Canonical = New-Object System.Collections.Generic.List[string]
+    Expires = ""
+    ParseWarnings = New-Object System.Collections.Generic.List[string]
+  }
+
+  foreach ($raw in $Text -split "`n") {
+    $line = $raw.Trim()
+    if (-not $line -or $line.StartsWith("#")) { continue }
+    $idx = $line.IndexOf(":")
+    if ($idx -lt 1) { $result.ParseWarnings.Add("Ignoring: $raw"); continue }
+    $k = $line.Substring(0,$idx).Trim().ToLower()
+    $v = $line.Substring($idx+1).Trim()
+    switch ($k) {
+      "contact"               { $result.Contact.Add($v) }
+      "canonical"             { $result.Canonical.Add($v) }
+      "encryption"            { $result.Encryption = $v }
+      "policy"                { $result.Policy = $v }
+      "acknowledgments"       { $result.Acknowledgments = $v }
+      "hiring"                { $result.Hiring = $v }
+      "preferred-languages"   { $result."Preferred-Languages" = $v }
+      "expires"               { $result.Expires = $v }
+      default                 { $result.ParseWarnings.Add("Unknown $($k): $($v)") }
+    }
+  }
+
+  $isValid = ""
+  try {
+    if ($result.Expires) {
+      $dt = [System.DateTimeOffset]::Parse($result.Expires)
+      $result.Expires = $dt.ToString("o")   # ISO 8601
+      $isValid = [System.Convert]::ToString($dt -gt [System.DateTimeOffset]::UtcNow)
+    }
+  } catch {
+    $result.ParseWarnings.Add("Unparseable Expires: " + $result.Expires)
+  }
+
+  return @($result, $isValid)
+}
+
+# --- Hauptlogik (sequenziell, 5.1-kompatibel) ---
+$domains = Get-Content -Path $InputList | Where-Object { $_.Trim() -ne "" -and -not $_.StartsWith("#") }
+
+$rows = New-Object System.Collections.Generic.List[object]
+
+foreach ($d in $domains) {
+  $d = $d.Trim().ToLower()
+  $found,$status,$text,$err = Get-SecurityTxt -Domain $d
+  $row = [ordered]@{
+    Domain = $d
+    FoundURL = $found
+    Status = $status
+    Contact = ""
+    Encryption = ""
+    Policy = ""
+    Acknowledgments = ""
+    Hiring = ""
+    "Preferred-Languages" = ""
+    Canonical = ""
+    Expires = ""
+    IsValid = ""
+    RawErrors = $err
+  }
+  if ($text) {
+    $parsed,$valid = Parse-SecurityTxt -Text $text
+    $row.Contact = ($parsed.Contact -join " | ")
+    $row.Encryption = $parsed.Encryption
+    $row.Policy = $parsed.Policy
+    $row.Acknowledgments = $parsed.Acknowledgments
+    $row.Hiring = $parsed.Hiring
+    $row."Preferred-Languages" = $parsed."Preferred-Languages"
+    $row.Canonical = ($parsed.Canonical -join " | ")
+    $row.Expires = $parsed.Expires
+    $row.IsValid = $valid
+    if ($parsed.ParseWarnings.Count -gt 0) {
+      $row.RawErrors = ($row.RawErrors + "; " + ($parsed.ParseWarnings -join "; ")).Trim("; ").Trim()
+    }
+  }
+  $rows.Add([pscustomobject]$row) | Out-Null
+}
+
+$rows | Sort-Object Domain | Export-Csv -NoTypeInformation -Path $OutputCsv -Encoding UTF8 -Delimiter ';'
